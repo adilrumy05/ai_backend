@@ -3,7 +3,7 @@ import mysql from 'mysql2/promise'; // Promise based for async/await support
 // Create a connection pool for efficient MySQL database access
 const pool = mysql.createPool({
   host: process.env.DB_HOST || '127.0.0.1', 
-  port: process.env.DB_PORT ? Number(process.env.DB_PORT) : 3306, // Database port 
+  port: process.env.DB_PORT ? Number(process.env.DB_PORT) : 3307, // Database port 
   user: process.env.DB_USER || 'root', // Database username
   password: process.env.DB_PASSWORD || '', // Database password 
   database: process.env.DB_NAME || 'sarawak_plant_db', // Default database name
@@ -126,6 +126,106 @@ export async function getObservationWithResults(observation_id) {
 
   // Return combined data: observation + AI predictions
   return { observation, results: resRows };
+}
+
+export async function listObservationsByStatus(
+  statuses = ['pending'],
+  limit = 20,
+  offset = 0,
+  opts = {}
+) {
+  const { autoFlagged = false, threshold = null } = opts;
+
+  const placeholders = statuses.map(() => '?').join(',');
+  const topExpr = 'COALESCE(MAX(ar.confidence_score), 0)';
+
+  const sqlParts = [];
+  sqlParts.push(`
+    SELECT
+      po.observation_id,
+      po.photo_url,
+      po.status,
+      ${topExpr} AS top_confidence,
+      po.created_at,
+      po.location_name,
+      po.user_id,
+      (
+        SELECT s.scientific_name
+        FROM ai_results ar2
+        LEFT JOIN species s ON s.species_id = ar2.species_id
+        WHERE ar2.observation_id = po.observation_id
+        ORDER BY ar2.rank ASC, ar2.confidence_score DESC
+        LIMIT 1
+      ) AS top_species_name
+    FROM plant_observations po
+    LEFT JOIN ai_results ar ON ar.observation_id = po.observation_id
+    WHERE po.status IN (${placeholders})
+    GROUP BY
+      po.observation_id,
+      po.photo_url,
+      po.status,
+      po.created_at,
+      po.location_name,
+      po.user_id
+  `);
+
+  const params = [...statuses];
+
+  if (autoFlagged && Number.isFinite(Number(threshold))) {
+    sqlParts.push(`HAVING ${topExpr} < ?`);
+    params.push(Number(threshold));
+  }
+
+  sqlParts.push(`ORDER BY po.created_at DESC LIMIT ? OFFSET ?`);
+  params.push(Number(limit), Number(offset));
+
+  const sql = sqlParts.join('\n');
+
+  const [rows] = await pool.query(sql, params);
+  return rows;
+}
+
+export async function updateObservationStatus(observation_id, status) {
+  await pool.query(
+    'UPDATE plant_observations SET status = ? WHERE observation_id = ?',
+    [status, observation_id]
+  );
+}
+
+export async function updateObservation({ observation_id, status, notes = null, species_name = null }) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    let species_id = null;
+    if (species_name && String(species_name).trim()) {
+      const [rows] = await conn.query('SELECT species_id FROM species WHERE scientific_name = ? LIMIT 1', [species_name.trim()]);
+      if (rows.length) species_id = rows[0].species_id;
+      else {
+        const [ins] = await conn.query('INSERT INTO species (scientific_name) VALUES (?)', [species_name.trim()]);
+        species_id = ins.insertId;
+      }
+    }
+
+    const fields = [];
+    const params = [];
+
+    if (status) { fields.push('status = ?'); params.push(status); }
+    if (notes !== undefined) { fields.push('notes = ?'); params.push(notes); }
+    if (species_id !== null) { fields.push('species_id = ?'); params.push(species_id); }
+
+    if (fields.length) {
+      params.push(observation_id);
+      await conn.query(`UPDATE plant_observations SET ${fields.join(', ')} WHERE observation_id = ?`, params);
+    }
+
+    await conn.commit();
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
 }
 
 export default pool; // Export the pool instance (used in server.js for general queries)
